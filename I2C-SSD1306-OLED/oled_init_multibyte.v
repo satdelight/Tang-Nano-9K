@@ -38,7 +38,7 @@ module oled_init_multibyte #(
         init_data[44] = 8'h00; init_data[45] = 8'h10;
         init_data[46] = 8'h00; init_data[47] = 8'hB0;
         init_data[48] = 8'h00; init_data[49] = 8'hAF;
-        init_data[50] = 8'h00; // (optional padding)
+        init_data[50] = 8'hA5; // Entire Display ON
         init_data[51] = 8'h00;
     end
 
