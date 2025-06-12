@@ -1,0 +1,199 @@
+module tm1638_7seg_demo(
+    input clk,          // 27 MHz system clock
+    input rst_n,        // Active-low reset
+    output reg tm_stb,  // TM1638 STB (chip select)
+    output reg tm_clk,  // TM1638 CLK
+    inout tm_dio        // TM1638 DIO (bi-directional data)
+);
+
+// 7-segment encoding for digits 0-9 (common cathode; adjust if needed for your TM1638)
+reg [7:0] seg_pattern [0:9];
+initial begin
+    seg_pattern[0] = 8'b00111111; // 0
+    seg_pattern[1] = 8'b00000110; // 1
+    seg_pattern[2] = 8'b01011011; // 2
+    seg_pattern[3] = 8'b01001111; // 3
+    seg_pattern[4] = 8'b01100110; // 4
+    seg_pattern[5] = 8'b01101101; // 5
+    seg_pattern[6] = 8'b01111101; // 6
+    seg_pattern[7] = 8'b00000111; // 7
+    seg_pattern[8] = 8'b01111111; // 8
+    seg_pattern[9] = 8'b01101111; // 9
+end
+
+// State machine and protocol variables for TM1638 communication
+reg [4:0] state = 0;        // FSM state
+reg [5:0] bitcnt = 0;       // Bit counter for shifting bytes out
+reg [7:0] shifter = 0;      // Current byte being shifted out
+reg [3:0] bytecnt = 0;      // Byte counter for data block
+reg tm_dio_out = 1'b1;      // Output value for DIO
+reg tm_dio_oe = 1'b1;       // Output enable for DIO (1=drive, 0=tri-state)
+assign tm_dio = tm_dio_oe ? tm_dio_out : 1'bz; // Tri-state buffer for DIO
+
+// Animation state: which digit is active, and which number to display
+reg [2:0] digit_idx = 0;    // Which digit to light (0..7)
+reg [3:0] number = 0;       // Which number to show (0..9)
+reg [23:0] timer = 0;       // Timer for animation pacing
+
+// Animation: update active digit and number every ~0.2s
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        timer <= 0;
+        digit_idx <= 0;
+        number <= 0;
+    end else begin
+        if (timer >= 5_400_000) begin // ~0.2s at 27 MHz
+            timer <= 0;
+            // Cycle digit index and number
+            digit_idx <= (digit_idx == 7) ? 0 : digit_idx + 1;
+            number <= (number == 9) ? 0 : number + 1;
+        end else begin
+            timer <= timer + 1;
+        end
+    end
+end
+
+// Data buffer for 16 bytes: even = segments, odd = LEDs
+// For TM1638, address 0/2/4...: segments; 1/3/5...: LED control
+reg [7:0] outbuf [0:15];
+integer i;
+always @(*) begin
+    for (i = 0; i < 8; i = i + 1) begin
+        // Show 'number' only on active digit; others blank
+        outbuf[i*2]   = (i == digit_idx) ? seg_pattern[number] : 8'h00;
+        outbuf[i*2+1] = 8'h00; // All LEDs off
+    end
+end
+
+// Main TM1638 protocol state machine
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        // Hold everything in reset
+        state <= 0;
+        tm_stb <= 1;
+        tm_clk <= 1;
+        tm_dio_out <= 1;
+        tm_dio_oe <= 1;
+        bitcnt <= 0;
+        bytecnt <= 0;
+    end else begin
+        case (state)
+        // 0. Send 0x40: set write mode, auto-increment address
+        0: begin
+            tm_stb <= 0;
+            shifter <= 8'b01000000; // 0x40
+            bitcnt <= 0;
+            tm_dio_oe <= 1;
+            state <= 1;
+        end
+        // 1-3. Shift out 8 command bits
+        1: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 2;
+        end
+        2: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 3;
+            else
+                state <= 1;
+        end
+        3: begin
+            tm_stb <= 1;
+            state <= 4;
+        end
+        // 4-7. Send 0xC0: start address 0 for data write
+        4: begin
+            tm_stb <= 0;
+            shifter <= 8'b11000000; // 0xC0
+            bitcnt <= 0;
+            tm_dio_oe <= 1;
+            state <= 5;
+        end
+        5: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 6;
+        end
+        6: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 7;
+            else
+                state <= 5;
+        end
+        // 7-12. Send 16 bytes: segments (even), LEDs (odd)
+        7: begin
+            bytecnt <= 0;
+            state <= 8;
+        end
+        8: begin
+            shifter <= outbuf[bytecnt];
+            bitcnt <= 0;
+            state <= 9;
+        end
+        9: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 10;
+        end
+        10: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 11;
+            else
+                state <= 9;
+        end
+        11: begin
+            bytecnt <= bytecnt + 1;
+            if (bytecnt == 15)
+                state <= 12;
+            else
+                state <= 8;
+        end
+        // 12. Finish data write (STB high)
+        12: begin
+            tm_stb <= 1;
+            state <= 13;
+        end
+        // 13-16. Send display control command (0x8F = display ON, max brightness)
+        // This sets global brightness for both LEDs and 7-segments!
+        13: begin
+            tm_stb <= 0;
+            shifter <= 8'b10001111; // 0x8F: display ON, max brightness
+            bitcnt <= 0;
+            tm_dio_oe <= 1;
+            state <= 14;
+        end
+        14: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 15;
+        end
+        15: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 16;
+            else
+                state <= 14;
+        end
+        // 16. End control command, then repeat forever
+        16: begin
+            tm_stb <= 1;
+            state <= 0;
+        end
+        default: state <= 0;
+        endcase
+    end
+end
+
+endmodule
