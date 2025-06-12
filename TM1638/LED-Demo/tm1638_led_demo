@@ -1,0 +1,186 @@
+module tm1638_led_demo(
+    input clk,          // 27 MHz clock
+    input rst_n,        // Active-low reset
+    output reg tm_stb,  // STB (chip select)
+    output reg tm_clk,  // CLK
+    inout tm_dio        // DIO (bi-directional)
+);
+
+// State machine variables for TM1638 protocol
+reg [4:0] state = 0;
+reg [5:0] bitcnt = 0;
+reg [7:0] shifter = 0;
+reg [3:0] bytecnt = 0;
+reg tm_dio_out = 1'b1;
+reg tm_dio_oe = 1'b1;
+// Tri-state assign for the bidirectional DIO line
+assign tm_dio = tm_dio_oe ? tm_dio_out : 1'bz;
+
+// Moving LED pattern register and timer for animation
+reg [7:0] led_pattern = 8'b0000_0001;
+reg [23:0] blink_timer = 0;
+
+// Timer and pattern update: move the lit LED left every ~0.2 seconds
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        blink_timer <= 0;
+        led_pattern <= 8'b0000_0001;
+    end else begin
+        if (blink_timer >= 5_400_000) begin // ~0.2s at 27MHz
+            blink_timer <= 0;
+            // Rotate left: when 1000_0000, wrap back to 0000_0001
+            if (led_pattern == 8'b1000_0000)
+                led_pattern <= 8'b0000_0001;
+            else
+                led_pattern <= led_pattern << 1;
+        end else begin
+            blink_timer <= blink_timer + 1;
+        end
+    end
+end
+
+// Data buffer for 16 bytes to send to TM1638:
+// Even addresses (0,2,...,14): 7-segment segment data (all OFF here)
+// Odd addresses (1,3,...,15): LED control (bit 0 ON/OFF, bits 1-7 ignored)
+reg [7:0] outbuf [0:15];
+integer i;
+
+// Populate outbuf (combinational): one moving LED ON, all 7-segments OFF
+always @(*) begin
+    for (i = 0; i < 8; i = i + 1) begin
+        outbuf[i*2]   = 8'h00; // Segments OFF
+        outbuf[i*2+1] = {7'b0, led_pattern[i]}; // LED ON/OFF
+    end
+end
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        state <= 0;
+        tm_stb <= 1;
+        tm_clk <= 1;
+        tm_dio_out <= 1;
+        tm_dio_oe <= 1;
+        bitcnt <= 0;
+        bytecnt <= 0;
+    end else begin
+        case (state)
+        // 0. Send 0x40 command: set write mode, auto-increment address
+        0: begin
+            tm_stb <= 0;
+            shifter <= 8'b01000000; // 0x40
+            bitcnt <= 0;
+            tm_dio_oe <= 1;
+            state <= 1;
+        end
+        // 1-3. Shift out 8 command bits
+        1: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 2;
+        end
+        2: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 3;
+            else
+                state <= 1;
+        end
+        3: begin
+            tm_stb <= 1;
+            state <= 4;
+        end
+        // 4-7. Send 0xC0 command: set start address 0 for data write
+        4: begin
+            tm_stb <= 0;
+            shifter <= 8'b11000000; // 0xC0
+            bitcnt <= 0;
+            tm_dio_oe <= 1;
+            state <= 5;
+        end
+        5: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 6;
+        end
+        6: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 7;
+            else
+                state <= 5;
+        end
+        // 7-12. Send 16 bytes: segments (even addr, all 0), LEDs (odd addr, pattern)
+        7: begin
+            bytecnt <= 0;
+            state <= 8;
+        end
+        8: begin
+            shifter <= outbuf[bytecnt];
+            bitcnt <= 0;
+            state <= 9;
+        end
+        9: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 10;
+        end
+        10: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 11;
+            else
+                state <= 9;
+        end
+        11: begin
+            bytecnt <= bytecnt + 1;
+            if (bytecnt == 15)
+                state <= 12;
+            else
+                state <= 8;
+        end
+        // 12. Finish data write (STB high)
+        12: begin
+            tm_stb <= 1;
+            state <= 13;
+        end
+        // 13-16. Send display control command (0x8F = display ON, brightness 7/MAX)
+        // Command format: 1000-DPPP (D=Display ON, PPP=brightness 0~7)
+        // This sets global brightness for both LEDs and 7-segments!
+        13: begin
+            tm_stb <= 0;
+            shifter <= 8'b10001111; // 0x8F: display ON, max brightness (7)
+            bitcnt <= 0;
+            tm_dio_oe <= 1;
+            state <= 14;
+        end
+        14: begin
+            tm_clk <= 0;
+            tm_dio_out <= shifter[0];
+            state <= 15;
+        end
+        15: begin
+            tm_clk <= 1;
+            shifter <= {1'b0, shifter[7:1]};
+            bitcnt <= bitcnt + 1;
+            if (bitcnt == 7)
+                state <= 16;
+            else
+                state <= 14;
+        end
+        // 16. End control command, then repeat
+        16: begin
+            tm_stb <= 1;
+            state <= 0; // Loop forever, to keep display updated
+        end
+        default: state <= 0;
+        endcase
+    end
+end
+
+endmodule
