@@ -1,0 +1,148 @@
+// Simple DCF77 pulse counter for Tang Nano with TM1638 display, no sync/second 59 logic
+module dcf77_pulse_counter_top(
+    input  wire clk,          // System clock (e.g., 27 MHz)
+    input  wire rst_n,        // Active low reset
+    input  wire dcf77_in,     // DCF77 digital input (low=idle, high=pulse)
+    output wire tm_stb,       // TM1638 strobe
+    output wire tm_clk,       // TM1638 clock
+    inout  wire tm_dio,       // TM1638 data I/O (open-drain)
+    output wire dcf_led_n     // onboard LED0 (active-low, lights on DCF77 pulse)
+);
+
+    // --- Synchronize DCF77 input (for metastability protection) ---
+    reg dcf77_sync_0, dcf77_sync_1;
+    always @(posedge clk) begin
+        dcf77_sync_0 <= dcf77_in;
+        dcf77_sync_1 <= dcf77_sync_0;
+    end
+    wire dcf77_sync = dcf77_sync_1;
+
+    // --- Edge detection ---
+    reg dcf77_last;
+    always @(posedge clk) dcf77_last <= dcf77_sync;
+    wire dcf77_rising = (~dcf77_last) & dcf77_sync;
+
+    // --- Onboard LED0 output: active-low, lights on DCF77 pulse ---
+    assign dcf_led_n = ~dcf77_sync;
+
+    // --- 28-bit counter for decimal display (max 99_999_999) ---
+    reg [27:0] counter;
+    always @(posedge clk or negedge rst_n)
+        if (!rst_n) counter <= 0;
+        else if (dcf77_rising) counter <= (counter < 28'd99_999_999) ? counter + 1 : 0;
+
+    // --- 8-bit binary counter for TM1638 LEDs ---
+    reg [7:0] bin_counter;
+    always @(posedge clk or negedge rst_n)
+        if (!rst_n) bin_counter <= 0;
+        else if (dcf77_rising) bin_counter <= bin_counter + 1;
+
+    // --- Decimal digit extraction for 8 digits (Verilog-safe) ---
+    reg [3:0] d7, d6, d5, d4, d3, d2, d1, d0;
+    reg [27:0] cnt_copy;
+    always @(*) begin
+        cnt_copy = counter;
+        d7 = cnt_copy / 10000000;
+        cnt_copy = cnt_copy % 10000000;
+        d6 = cnt_copy / 1000000;
+        cnt_copy = cnt_copy % 1000000;
+        d5 = cnt_copy / 100000;
+        cnt_copy = cnt_copy % 100000;
+        d4 = cnt_copy / 10000;
+        cnt_copy = cnt_copy % 10000;
+        d3 = cnt_copy / 1000;
+        cnt_copy = cnt_copy % 1000;
+        d2 = cnt_copy / 100;
+        cnt_copy = cnt_copy % 100;
+        d1 = cnt_copy / 10;
+        d0 = cnt_copy % 10;
+    end
+
+    // --- 7-segment patterns for 0-9 and blank ---
+    function [7:0] seg_pattern;
+        input [3:0] val;
+        begin
+            case(val)
+                4'd0: seg_pattern = 8'b00111111; // 0
+                4'd1: seg_pattern = 8'b00000110; // 1
+                4'd2: seg_pattern = 8'b01011011; // 2
+                4'd3: seg_pattern = 8'b01001111; // 3
+                4'd4: seg_pattern = 8'b01100110; // 4
+                4'd5: seg_pattern = 8'b01101101; // 5
+                4'd6: seg_pattern = 8'b01111101; // 6
+                4'd7: seg_pattern = 8'b00000111; // 7
+                4'd8: seg_pattern = 8'b01111111; // 8
+                4'd9: seg_pattern = 8'b01101111; // 9
+                default: seg_pattern = 8'b00000000; // blank
+            endcase
+        end
+    endfunction
+
+    // --- TM1638 Display Buffer (8 digits, even: segs, odd: LEDs) ---
+    reg [7:0] outbuf [0:15];
+    integer i;
+    always @(*) begin
+        outbuf[0]  = seg_pattern(d7);
+        outbuf[2]  = seg_pattern(d6);
+        outbuf[4]  = seg_pattern(d5);
+        outbuf[6]  = seg_pattern(d4);
+        outbuf[8]  = seg_pattern(d3);
+        outbuf[10] = seg_pattern(d2);
+        outbuf[12] = seg_pattern(d1);
+        outbuf[14] = seg_pattern(d0);
+        // LEDs: LED0 (leftmost) = MSB, LED7 (rightmost) = LSB
+        for (i = 0; i < 8; i = i + 1)
+            outbuf[i*2 + 1] = {7'b0, bin_counter[7-i]};
+    end
+
+    // --- TM1638 protocol FSM (brightness set to 3) ---
+    reg [4:0] state;
+    reg [5:0] bitcnt;
+    reg [7:0] shifter;
+    reg [3:0] bytecnt;
+    reg tm_dio_out;
+    reg tm_dio_oe;
+    assign tm_dio = tm_dio_oe ? tm_dio_out : 1'bz;
+    reg tm_stb_r, tm_clk_r;
+    assign tm_stb = tm_stb_r;
+    assign tm_clk = tm_clk_r;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= 0;
+            tm_stb_r <= 1;
+            tm_clk_r <= 1;
+            tm_dio_out <= 1;
+            tm_dio_oe <= 1;
+            bitcnt <= 0;
+            bytecnt <= 0;
+        end else begin
+            case (state)
+            0: begin tm_stb_r <= 0; shifter <= 8'b01000000; bitcnt <= 0; tm_dio_oe <= 1; state <= 1; end
+            1: begin tm_clk_r <= 0; tm_dio_out <= shifter[0]; state <= 2; end
+            2: begin tm_clk_r <= 1; shifter <= {1'b0, shifter[7:1]}; bitcnt <= bitcnt + 1;
+                if (bitcnt == 7) state <= 3; else state <= 1; end
+            3: begin tm_stb_r <= 1; state <= 4; end
+            4: begin tm_stb_r <= 0; shifter <= 8'b11000000; bitcnt <= 0; tm_dio_oe <= 1; state <= 5; end
+            5: begin tm_clk_r <= 0; tm_dio_out <= shifter[0]; state <= 6; end
+            6: begin tm_clk_r <= 1; shifter <= {1'b0, shifter[7:1]}; bitcnt <= bitcnt + 1;
+                if (bitcnt == 7) state <= 7; else state <= 5; end
+            7: begin bytecnt <= 0; state <= 8; end
+            8: begin shifter <= outbuf[bytecnt]; bitcnt <= 0; state <= 9; end
+            9: begin tm_clk_r <= 0; tm_dio_out <= shifter[0]; state <= 10; end
+            10: begin tm_clk_r <= 1; shifter <= {1'b0, shifter[7:1]}; bitcnt <= bitcnt + 1;
+                if (bitcnt == 7) state <= 11; else state <= 9; end
+            11: begin bytecnt <= bytecnt + 1;
+                if (bytecnt == 15) state <= 12; else state <= 8; end
+            12: begin tm_stb_r <= 1; state <= 13; end
+            13: begin tm_stb_r <= 0; shifter <= 8'b10001011; bitcnt <= 0; tm_dio_oe <= 1; state <= 14; end // brightness 3
+            14: begin tm_clk_r <= 0; tm_dio_out <= shifter[0]; state <= 15; end
+            15: begin tm_clk_r <= 1; shifter <= {1'b0, shifter[7:1]}; bitcnt <= bitcnt + 1;
+                if (bitcnt == 7) state <= 16; else state <= 14; end
+            16: begin tm_stb_r <= 1; state <= 0; end
+            default: state <= 0;
+            endcase
+        end
+    end
+
+endmodule
